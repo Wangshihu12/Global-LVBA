@@ -48,7 +48,29 @@ namespace lvba {
 // ======================= 重投影（含畸变）+ 白化 =======================
 // 模型：Brown–Conrady，参数顺序：k1,k2,p1,p2
 // 白化：像素残差分别除以 su, sv（常用 su=sv=1.0 px 或 0.5 px）
+
+/**
+ * [功能描述]：带畸变的重投影误差Ceres代价函数结构体，支持白化处理。
+ *            用于视觉BA优化，计算3D点投影到图像平面的重投影误差。
+ *            畸变模型采用Brown-Conrady模型，包含径向畸变(k1,k2)和切向畸变(p1,p2)。
+ *            投影流程：世界坐标 -> 相机坐标 -> 归一化坐标 -> 畸变校正 -> 像素坐标
+ */
 struct ReprojErrorWhitenedDistorted {
+    /**
+     * [功能描述]：构造函数，初始化观测值、相机内参、畸变参数和白化系数。
+     * @param u：观测到的像素坐标u（水平方向）。
+     * @param v：观测到的像素坐标v（垂直方向）。
+     * @param fx：相机内参，x方向焦距（像素单位）。
+     * @param fy：相机内参，y方向焦距（像素单位）。
+     * @param cx：相机内参，主点x坐标。
+     * @param cy：相机内参，主点y坐标。
+     * @param k1：径向畸变系数（2阶项）。
+     * @param k2：径向畸变系数（4阶项）。
+     * @param p1：切向畸变系数。
+     * @param p2：切向畸变系数。
+     * @param su：u方向白化系数（标准差），默认1.0像素。
+     * @param sv：v方向白化系数（标准差），默认1.0像素。
+     */
     ReprojErrorWhitenedDistorted(double u, double v,
                                  double fx, double fy, double cx, double cy,
                                  double k1, double k2, double p1, double p2,
@@ -58,92 +80,160 @@ struct ReprojErrorWhitenedDistorted {
       k1_(k1), k2_(k2), p1_(p1), p2_(p2),
       su_(su), sv_(sv) {}
   
+    /**
+     * [功能描述]：Ceres自动求导所需的残差计算函数模板。
+     * @param q_cw：相机到世界坐标系的旋转四元数 [w, x, y, z]，4维数组。
+     * @param t_cw：相机到世界坐标系的平移向量 [tx, ty, tz]，3维数组。
+     * @param X_w：3D点的世界坐标 [X, Y, Z]，3维数组。
+     * @param residuals：输出的残差数组，2维，分别为u和v方向的白化重投影误差。
+     * @return 始终返回true，表示残差计算成功。
+     */
     template <typename T>
-    bool operator()(const T* const q_cw,    // [w, x, y, z]
-                    const T* const t_cw,    // [tx, ty, tz]
-                    const T* const X_w,     // [X, Y, Z]
+    bool operator()(const T* const q_cw,    // [w, x, y, z] 旋转四元数
+                    const T* const t_cw,    // [tx, ty, tz] 平移向量
+                    const T* const X_w,     // [X, Y, Z] 世界坐标点
                     T* residuals) const {
 
-      // 世界 -> 相机
+      // ====== 步骤1：世界坐标 -> 相机坐标 ======
+      // Xc = R * Xw + t，其中R由四元数q_cw表示
       T Xc[3];
       {
-        T Xw[3] = { X_w[0], X_w[1], X_w[2] };
-        T RX[3];
+        T Xw[3] = { X_w[0], X_w[1], X_w[2] };  // 复制世界坐标点
+        T RX[3];  // 旋转后的坐标
+        // 使用Ceres提供的四元数旋转函数：RX = R(q_cw) * Xw
         ceres::QuaternionRotatePoint(q_cw, Xw, RX);
+        // 加上平移向量得到相机坐标
         Xc[0] = RX[0] + t_cw[0];
         Xc[1] = RX[1] + t_cw[1];
         Xc[2] = RX[2] + t_cw[2];
       }
 
+      // 深度值过小时（点在相机后方或太近），返回零残差避免数值问题
       if (Xc[2] <= T(1e-8)) { residuals[0] = T(0); residuals[1] = T(0); return true; };
   
       // 数值稳定：避免 z→0 或 z<=0
-      T z = Xc[2];
+      T z = Xc[2];  // 相机坐标系下的深度值
     //   const T z_min = T(1e-8);
     //   z = z < z_min ? z_min : z;
   
-      // 归一化坐标
+      // ====== 步骤2：相机坐标 -> 归一化坐标 ======
+      // 归一化坐标：xn = Xc/Zc, yn = Yc/Zc
       const T xn = Xc[0] / z;
       const T yn = Xc[1] / z;
   
-      // Brown–Conrady 畸变
+      // ====== 步骤3：应用Brown-Conrady畸变模型 ======
+      // 计算径向距离的平方：r² = xn² + yn²
       const T r2 = xn*xn + yn*yn;
-      const T r4 = r2 * r2;
+      const T r4 = r2 * r2;  // r⁴
   
+      // 将畸变系数转换为模板类型T
       const T k1 = T(k1_), k2 = T(k2_);
       const T p1 = T(p1_), p2 = T(p2_);
   
+      // 径向畸变因子：1 + k1*r² + k2*r⁴
       const T radial = T(1.0) + k1*r2 + k2*r4;
+      // 切向畸变（x方向）：2*p1*xn*yn + p2*(r² + 2*xn²)
       const T x_tan  = T(2.0)*p1*xn*yn + p2*(r2 + T(2.0)*xn*xn);
+      // 切向畸变（y方向）：p1*(r² + 2*yn²) + 2*p2*xn*yn
       const T y_tan  = p1*(r2 + T(2.0)*yn*yn) + T(2.0)*p2*xn*yn;
   
-      const T xdist = xn * radial + x_tan;
-      const T ydist = yn * radial + y_tan;
+      // 畸变后的归一化坐标
+      const T xdist = xn * radial + x_tan;  // xdist = xn * (1 + k1*r² + k2*r⁴) + 切向畸变
+      const T ydist = yn * radial + y_tan;  // ydist = yn * (1 + k1*r² + k2*r⁴) + 切向畸变
   
-      // 像素坐标
+      // ====== 步骤4：归一化坐标 -> 像素坐标 ======
+      // 像素坐标：u = fx * xdist + cx, v = fy * ydist + cy
       const T u_pred = T(fx_) * xdist + T(cx_);
       const T v_pred = T(fy_) * ydist + T(cy_);
   
-      // 白化（同一度量）
-      residuals[0] = (u_pred - T(u_)) / T(su_);
-      residuals[1] = (v_pred - T(v_)) / T(sv_);
+      // ====== 步骤5：计算白化后的重投影残差 ======
+      // 残差 = (预测值 - 观测值) / 标准差
+      residuals[0] = (u_pred - T(u_)) / T(su_);  // u方向残差
+      residuals[1] = (v_pred - T(v_)) / T(sv_);  // v方向残差
       return true;
     }
   
+    /**
+     * [功能描述]：静态工厂方法，创建Ceres自动求导代价函数。
+     * @param u：观测到的像素坐标u。
+     * @param v：观测到的像素坐标v。
+     * @param fx：相机内参，x方向焦距。
+     * @param fy：相机内参，y方向焦距。
+     * @param cx：相机内参，主点x坐标。
+     * @param cy：相机内参，主点y坐标。
+     * @param k1：径向畸变系数（2阶项）。
+     * @param k2：径向畸变系数（4阶项）。
+     * @param p1：切向畸变系数。
+     * @param p2：切向畸变系数。
+     * @param su：u方向白化系数，默认1.0。
+     * @param sv：v方向白化系数，默认1.0。
+     * @return 返回Ceres代价函数指针，残差维度为2，参数块维度分别为4（四元数）、3（平移）、3（3D点）。
+     */
     static ceres::CostFunction* Create(double u, double v,
                                        double fx, double fy, double cx, double cy,
                                        double k1, double k2, double p1, double p2,
                                        double su = 1.0, double sv = 1.0) {
+      // AutoDiffCostFunction模板参数：<代价函数结构体, 残差维度, 参数块1维度, 参数块2维度, 参数块3维度>
       return (new ceres::AutoDiffCostFunction<ReprojErrorWhitenedDistorted, 2, 4, 3, 3>(
                 new ReprojErrorWhitenedDistorted(u, v, fx, fy, cx, cy, k1, k2, p1, p2, su, sv)));
     }
   
-    double u_, v_;
-    double fx_, fy_, cx_, cy_;
-    double k1_, k2_, p1_, p2_;
-    double su_, sv_;
+    // 成员变量
+    double u_, v_;              // 观测到的像素坐标
+    double fx_, fy_, cx_, cy_;  // 相机内参：焦距和主点
+    double k1_, k2_, p1_, p2_;  // Brown-Conrady畸变参数：k1,k2为径向畸变，p1,p2为切向畸变
+    double su_, sv_;            // 白化系数（u和v方向的标准差）
 };
 
 // ================ 点到平面距离 + 白化（1维残差） =================
 // r = (n^T X + d) / sigma
+
+/**
+ * [功能描述]：点到平面距离误差的Ceres代价函数结构体，带有白化处理。
+ *            用于优化3D点的位置，使其满足平面约束。
+ *            平面方程为：nx*x + ny*y + nz*z + d = 0
+ *            残差公式为：r = |n^T * X + d| / sigma（白化后的点到平面距离）
+ */
 struct PointPlaneErrorWhitened {
+    /**
+     * [功能描述]：构造函数，初始化平面参数和白化系数。
+     * @param n：平面的单位法向量，Eigen::Vector3d类型。
+     * @param d：平面方程中的常数项（平面到原点的有符号距离）。
+     * @param sigma：白化系数（标准差），用于归一化残差，设置下限为1e-9防止除零。
+     */
     PointPlaneErrorWhitened(const Eigen::Vector3d& n, double d, double sigma)
     : nx_(n.x()), ny_(n.y()), nz_(n.z()), d_(d), s_(std::max(1e-9, sigma)) {}
   
+    /**
+     * [功能描述]：Ceres自动求导所需的残差计算函数模板。
+     * @param X_w：待优化的3D点坐标（世界坐标系），数组形式[x, y, z]。
+     * @param residuals：输出的残差数组，1维，存储白化后的点到平面距离。
+     * @return 始终返回true，表示残差计算成功。
+     */
     template <typename T>
     bool operator()(const T* const X_w, T* residuals) const {
+      // 计算点到平面的有符号距离：r = -(nx*x + ny*y + nz*z + d)
+      // 注意：这里取负号是为了使残差符号与平面方程一致
       T r = T(0.) - (T(nx_) * X_w[0] + T(ny_) * X_w[1] + T(nz_) * X_w[2] + T(d_));
       // residuals[0] = ceres::sqrt(r * r) / T(s_);
-        residuals[0] = ceres::sqrt(r * r + 1e-12) / T(s_);
+      // 计算白化后的绝对距离：添加1e-12防止sqrt(0)导致梯度为无穷大
+      residuals[0] = ceres::sqrt(r * r + 1e-12) / T(s_);
       return true;
     }
   
+    /**
+     * [功能描述]：静态工厂方法，创建Ceres自动求导代价函数。
+     * @param n：平面的单位法向量。
+     * @param d：平面方程中的常数项。
+     * @param sigma：白化系数（标准差）。
+     * @return 返回Ceres代价函数指针，残差维度为1，待优化参数维度为3（3D点坐标）。
+     */
     static ceres::CostFunction* Create(const Eigen::Vector3d& n, double d, double sigma) {
       return (new ceres::AutoDiffCostFunction<PointPlaneErrorWhitened, 1, 3>(
                 new PointPlaneErrorWhitened(n, d, sigma)));
     }
   
-    double nx_, ny_, nz_, d_, s_;
+    double nx_, ny_, nz_, d_, s_;  // 成员变量：法向量分量(nx_, ny_, nz_)、平面常数项(d_)、白化系数(s_)
 };
 
 // ---- 输出 Track 结构 ----
