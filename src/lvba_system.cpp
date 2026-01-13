@@ -1796,7 +1796,8 @@ void LvbaSystem::optimizeCameraPoses()
     // ---------- 6.1 添加相机位姿参数块 ----------
     for (int k = 0; k < M; ++k) {
         // 四元数使用EigenQuaternionManifold流形约束（保持单位四元数）
-        problem.AddParameterBlock(qs[k].data(), 4, new ceres::EigenQuaternionManifold());
+        // problem.AddParameterBlock(qs[k].data(), 4, new ceres::EigenQuaternionManifold());
+        problem.AddParameterBlock(qs[k].data(), 4, new ceres::EigenQuaternionParameterization());
         problem.AddParameterBlock(ts[k].data(), 3);
     }
     // 固定第一个相机位姿作为参考（消除规范自由度）
